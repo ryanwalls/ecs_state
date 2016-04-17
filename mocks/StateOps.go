@@ -1,6 +1,6 @@
 package mocks
 
-import "github.com/jhspaybar/ecsstate"
+import "github.com/ryanwalls/ecsstate"
 import "github.com/stretchr/testify/mock"
 
 import "github.com/aws/aws-sdk-go/service/ecs"

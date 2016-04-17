@@ -1,4 +1,4 @@
-package: github.com/jhspaybar/ecs_state
+package: github.com/ryanwalls/ecsstate
 import:
 - package: github.com/aws/aws-sdk-go
   subpackages:
