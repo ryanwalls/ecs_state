@@ -16,6 +16,7 @@ import (
 	"github.com/aws/aws-sdk-go/aws"
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ecs"
+	"github.com/aws/aws-sdk-go/service/ecs/ecsiface"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
 )
@@ -24,14 +25,14 @@ import (
 type State struct {
 	clusterName string
 	db          *gorm.DB
-	ecs_client  *ecs.ECS
+	ecs_client  ecsiface.ECSAPI
 	log         Logger
 }
 
 // Create a new State object.  The clusterName is the cluster to track, ecs_client should be provided by the caller
 // with proper credentials preferably scoped to read only access to ECS APIs, and the logger can use ecs_state.DefaultLogger
 // for output on stdout, or the user can provide a custom logger instead.
-func Initialize(clusterName string, ecs_client *ecs.ECS, logger Logger) StateOps {
+func Initialize(clusterName string, ecs_client ecsiface.ECSAPI, logger Logger) StateOps {
 	logger.Info("Intializing ecs_state for cluster ", clusterName)
 
 	db, err := gorm.Open("sqlite3", ":memory:")
