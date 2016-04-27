@@ -21,7 +21,7 @@ import (
 	_ "github.com/mattn/go-sqlite3"
 )
 
-var Log log.Logger
+var Log = log.New()
 
 func init() {
 	Log.SetHandler(log.DiscardHandler())
