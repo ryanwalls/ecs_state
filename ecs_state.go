@@ -8,7 +8,6 @@ package ecsstate
 import (
 	"bytes"
 	"fmt"
-	"os"
 	"strconv"
 	"strings"
 	"time"
@@ -17,35 +16,40 @@ import (
 	"github.com/aws/aws-sdk-go/aws/awserr"
 	"github.com/aws/aws-sdk-go/service/ecs"
 	"github.com/aws/aws-sdk-go/service/ecs/ecsiface"
+	log "github.com/inconshreveable/log15"
 	"github.com/jinzhu/gorm"
 	_ "github.com/mattn/go-sqlite3"
 )
+
+var Log log.Logger
+
+func init() {
+	Log.SetHandler(log.DiscardHandler())
+}
 
 // The State object provides methods to synchronize and query the state of the ECS cluster.
 type State struct {
 	clusterName string
 	db          *gorm.DB
 	ecs_client  ecsiface.ECSAPI
-	log         Logger
+	log         log.Logger
 }
 
 // Create a new State object.  The clusterName is the cluster to track, ecs_client should be provided by the caller
 // with proper credentials preferably scoped to read only access to ECS APIs, and the logger can use ecs_state.DefaultLogger
 // for output on stdout, or the user can provide a custom logger instead.
-func Initialize(clusterName string, ecs_client ecsiface.ECSAPI, logger Logger) StateOps {
-	logger.Info("Intializing ecs_state for cluster ", clusterName)
+func Initialize(clusterName string, ecs_client ecsiface.ECSAPI) StateOps {
+	Log.Info("Intializing ecs_state", "cluster", clusterName)
 
 	db, err := gorm.Open("sqlite3", ":memory:")
 	if err != nil {
-		logger.Error("Unable to initialize local database for ecs_state")
-		os.Exit(1)
+		panic("Unable to initialize local database for ecs_state")
 	}
 
-	db.SetLogger(logger)
 	db.AutoMigrate(&Cluster{}, &ContainerInstance{}, &Task{}, &TaskDefinition{})
 	db.Model(&ContainerInstance{}).AddIndex("idx_remaining_cpu_memory_tcp_udp", "remaining_cpu", "remaining_memory", "remaining_tcp_ports", "remaining_udp_ports")
 
-	return &State{clusterName: clusterName, db: db, ecs_client: ecs_client, log: logger}
+	return &State{clusterName: clusterName, db: db, ecs_client: ecs_client, log: Log.New()}
 }
 
 // Provides direct access to the database through gorm to allow more advanced queries against state.
@@ -58,15 +62,15 @@ func (state *State) handleAwsError(err error) {
 	if err != nil {
 		if awsErr, ok := err.(awserr.Error); ok {
 			// Generic AWS error with Code, Message, and original error (if any)
-			state.log.Error("Error encountered calling ECS", awsErr.Code(), awsErr.Message(), awsErr.OrigErr())
+			state.log.Error("Error encountered calling ECS", "code", awsErr.Code(), "message", awsErr.Message(), "originalErr", awsErr.OrigErr())
 			if reqErr, ok := err.(awserr.RequestFailure); ok {
 				// A service error occurred
-				state.log.Error(reqErr.Code(), reqErr.Message(), reqErr.StatusCode(), reqErr.RequestID())
+				state.log.Error("Error contacting AWS", "code", reqErr.Code(), "message", reqErr.Message(), "statusCode", reqErr.StatusCode(), "requestID", reqErr.RequestID())
 			}
 		} else {
 			// This case should never be hit, the SDK should always return an
 			// error which satisfies the awserr.Error interface.
-			state.log.Error(err.Error())
+			state.log.Error("Unexpected error", "err", err)
 		}
 	}
 }
@@ -74,16 +78,16 @@ func (state *State) handleAwsError(err error) {
 // Many ECS Apis return a generic Failure object, this methods parses and logs generic Failures.
 func (state *State) handleFailures(failures []*ecs.Failure) {
 	if len(failures) != 0 {
-		state.log.Warn("Encountered", len(failures), "failures when contacting ECS")
+		state.log.Warn("Encountered failures when contacting ECS", "numFailures", len(failures))
 		for _, failure := range failures {
-			state.log.Warn("Failure ARN:", *failure.Arn, ", Reason:", *failure.Reason)
+			state.log.Warn("Listing failure", "Failure ARN", *failure.Arn, "Reason", *failure.Reason)
 		}
 	}
 }
 
 // Performs ECS DescribeCluster call on the clusterName provided at Initialization time and updates the local copy of state.
 func (state *State) RefreshClusterState() {
-	state.log.Info("entering RefreshClusterState()")
+	state.log.Info("Refreshing the state of the cluster", "cluster", state.clusterName)
 	params := &ecs.DescribeClustersInput{
 		Clusters: []*string{
 			aws.String(state.clusterName),
@@ -100,7 +104,7 @@ func (state *State) RefreshClusterState() {
 	for _, cluster := range resp.Clusters {
 		clusterModel := Cluster{}
 		state.db.Where(Cluster{ARN: *cluster.ClusterArn}).Assign(Cluster{Name: *cluster.ClusterName, Status: *cluster.Status}).FirstOrCreate(&clusterModel)
-		state.log.Debug(fmt.Sprintf("Refreshed cluster: %+v", cluster))
+		state.log.Debug("Refreshed cluster", "cluster", cluster)
 	}
 }
 
@@ -108,7 +112,7 @@ func (state *State) RefreshClusterState() {
 // Any ContainerInstances no longer returned by ECS, for example if they have been deregistered, will be
 // removed from the local view of state as well.
 func (state *State) RefreshContainerInstanceState() {
-	state.log.Info("entering RefreshContainerInstanceState()")
+	state.log.Info("Refreshing container instance state")
 	params := &ecs.ListContainerInstancesInput{
 		Cluster: aws.String(state.clusterName),
 	}
@@ -136,7 +140,7 @@ func (state *State) RefreshContainerInstanceState() {
 			assignment := state.containerInstanceAssignment(cluster, containerInstance)
 			assignment.RefreshTime = refreshTime
 			state.db.Where(finder).Assign(assignment).FirstOrCreate(&containerInstanceModel)
-			state.log.Debug(fmt.Sprintf("Refreshed ContainerInstance: %+v", containerInstance))
+			state.log.Debug("Refreshed ContainerInstance", "instance", containerInstance)
 		}
 
 		return !lastPage
@@ -149,7 +153,7 @@ func (state *State) RefreshContainerInstanceState() {
 
 	oldContainerInstances := []ContainerInstance{}
 	state.DB().Where("refresh_time < ?", refreshTime).Find(&oldContainerInstances)
-	state.log.Debug(fmt.Sprintf("Found %d old Container Instances", len(oldContainerInstances)))
+	state.log.Debug("Found old Container Instances", "numOldContainerInstances", len(oldContainerInstances))
 	for _, oldContainerInstance := range oldContainerInstances {
 		state.DB().Delete(&oldContainerInstance)
 	}
@@ -160,6 +164,7 @@ func (state *State) RefreshContainerInstanceState() {
 // Any Tasks no longer returned by ECS, for example if they have been stopped, will be
 // removed from the local view of state as well.
 func (state *State) RefreshTaskState() {
+	state.log.Info("Refreshing task state")
 	params := &ecs.ListTasksInput{
 		Cluster: aws.String(state.clusterName),
 	}
@@ -186,7 +191,7 @@ func (state *State) RefreshTaskState() {
 			assignment := state.taskAssignment(task)
 			assignment.RefreshTime = refreshTime
 			state.DB().Where(finder).Assign(assignment).FirstOrCreate(&taskModel)
-			state.log.Debug(fmt.Sprintf("Refreshed Task: %+v", task))
+			state.log.Debug("Refreshed Task", "task", task)
 		}
 
 		return !lastPage
@@ -199,7 +204,7 @@ func (state *State) RefreshTaskState() {
 
 	oldTasks := []Task{}
 	state.DB().Where("refresh_time < ?", refreshTime).Find(&oldTasks)
-	state.log.Debug(fmt.Sprintf("Found %d old Tasks", len(oldTasks)))
+	state.log.Debug("Found old Tasks", "numOldTasks", len(oldTasks))
 	for _, oldTask := range oldTasks {
 		state.DB().Delete(&oldTask)
 	}
@@ -296,7 +301,7 @@ func (state *State) containerInstanceAssignment(cluster Cluster, containerInstan
 
 // Load the cluster and all ContainerInstances and Tasks into memory as Go objects.
 func (state *State) FindClusterByName(name string) Cluster {
-	state.log.Info("entering FindClusterByName()")
+	state.log.Debug("entering FindClusterByName()")
 	cluster := Cluster{}
 	state.DB().Where("name = ?", name).Preload("ContainerInstances").Preload("Tasks").Preload("ContainerInstances.Tasks").First(&cluster)
 	return cluster
@@ -304,16 +309,16 @@ func (state *State) FindClusterByName(name string) Cluster {
 
 // Resolve and cache locally a Task Definition from either a short string like my_app:1 or a full ARN.
 func (state *State) FindTaskDefinition(td string) TaskDefinition {
-	state.log.Info("entering FindTaskDefinition()")
+	state.log.Info("Looking for task definition", "taskDefinition", td)
 	queryString := "short_string = ?"
 	if strings.HasPrefix(td, "arn:aws:ecs:") {
 		queryString = "a_r_n = ?"
 	}
 
-	state.log.Debug("Query prefix is:", queryString)
+	state.log.Debug("Querying with prefix", "prefix", queryString)
 	taskDefinition := TaskDefinition{}
 	if state.DB().Where(queryString, td).First(&taskDefinition).RecordNotFound() {
-		state.log.Debug(fmt.Sprintf("TaskDefinition %s not found, calling ECS service.", td))
+		state.log.Info("TaskDefinition not found locally, calling ECS service.", "taskDefinition", td)
 		params := &ecs.DescribeTaskDefinitionInput{
 			TaskDefinition: aws.String(td),
 		}
@@ -348,10 +353,10 @@ func (state *State) FindTaskDefinition(td string) TaskDefinition {
 		taskDefinition.UDPPorts = strings.Join(udpPorts, ",")
 
 		state.DB().Create(&taskDefinition)
-		state.log.Debug(fmt.Sprintf("Inserted TaskDefinition: %+v", taskDefinition))
+		state.log.Debug("Inserted TaskDefinition", "taskDefinition", taskDefinition)
 	}
 
-	state.log.Debug(fmt.Sprintf("TaskDefinition is: %+v", taskDefinition))
+	state.log.Info("Found task definition", "taskDefinition", taskDefinition)
 	return taskDefinition
 }
 
@@ -372,7 +377,7 @@ func (state *State) buildPortQuery(column, ports string) string {
 // Returns all ContainerInstances where the desired TaskDefinition has resources available.
 // Additional filtering or constraints can be added if required.
 func (state *State) FindLocationsForTaskDefinition(td string) *[]ContainerInstance {
-	state.log.Info("entering FindLocationsForTaskDefinition()")
+	state.log.Info("Finding locations where task definition could run", "td", td)
 	taskDefinition := state.FindTaskDefinition(td)
 
 	query := []string{"remaining_cpu >= ? AND remaining_memory >= ? AND agent_connected = ?"}
@@ -385,9 +390,10 @@ func (state *State) FindLocationsForTaskDefinition(td string) *[]ContainerInstan
 		query = append(query, udp_query)
 	}
 	fullQuery := strings.Join(query, " AND ")
-	state.log.Debug("Full query is:", fullQuery)
+	state.log.Debug("Created full query", "fullQuery", fullQuery)
 
 	containerInstances := []ContainerInstance{}
 	state.DB().Where(fullQuery, taskDefinition.Cpu, taskDefinition.Memory, true).Find(&containerInstances)
+	state.log.Info(fmt.Sprintf("Found %v locations where task definition could run", len(containerInstances)), "td", td)
 	return &containerInstances
 }
